@@ -1,0 +1,57 @@
+# LXR Community License v1.0
+Copyright (c) Hannes Väisänen
+
+## TL;DR
+
+✅ Use LXR in personal projects
+✅ Use LXR in commercial games
+✅ Modify the source code
+✅ Create internal company forks
+✅ Learn from and contribute to the project
+✅ Ship games that include LXR
+
+❌ Sell LXR itself
+❌ Upload LXR or modified versions of LXR to Fab, Unreal Marketplace, GitHub releases, or other distribution channels
+❌ Redistribute LXR binaries
+❌ Repackage LXR as your own plugin or competing product
+
+If you're making a game with LXR, you're good.
+If you're trying to sell LXR, don't.
+
+# License
+Permission is granted to any person obtaining a copy of the LXR source code ("Software") to:
+
+* View, study, and learn from the Software.
+* Modify the Software for personal, educational, or commercial use.
+* Compile and use the Software in commercial and non-commercial products, including video games and applications.
+* Distribute products that incorporate the Software as a component of a larger work.
+
+The following activities are prohibited without prior written permission from the copyright holder:
+
+* Selling, sublicensing, relicensing, or otherwise commercializing the Software itself.
+* Redistributing the Software, whether modified or unmodified, as a standalone plugin, framework, toolkit, library, or competing product.
+* Publishing compiled binaries of the Software for public distribution.
+* Uploading, selling, or distributing the Software, whether modified or unmodified, through marketplaces, asset stores, plugin stores, package repositories, or similar distribution channels.
+
+Any distributed copy of the Software or derivative works must retain this copyright notice and license text.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
+
+Official binary releases of LXR are distributed exclusively through channels authorized by the copyright holder.
+
+
+### Examples
+
+**Allowed**
+
+* Using LXR in a commercial game.
+* Modifying LXR for your studio's internal needs.
+* Forking LXR privately within your company.
+* Submitting pull requests to improve LXR.
+
+**Not Allowed**
+
+* Uploading LXR binaries to Fab.
+* Selling a modified version of LXR as a plugin.
+* Redistributing LXR as part of a plugin bundle.
+* Rebranding LXR and publishing it as your own product.
