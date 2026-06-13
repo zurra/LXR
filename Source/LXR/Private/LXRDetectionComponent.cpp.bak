@@ -1,0 +1,1745 @@
+// Copyright Clusterfact Games 2023.  All Rights Reserved.
+
+#include "LXRDetectionComponent.h"
+#include "LXRSourceComponent.h"
+#include "LXRFunctionLibrary.h"
+#include "LXRSubsystem.h"
+#include "LXR_Shared.h"
+#include "LXR.h"
+
+#include "Components/SkeletalMeshComponent.h"
+#include "Components/LocalLightComponent.h"
+#include "DrawDebugHelpers.h"
+#include "TimerManager.h"
+#include "Engine/World.h"
+#include "Net/UnrealNetwork.h"
+
+#include "Tasks/ProcessDetectionTaskAsyncTask.h"
+
+bool DoCalculation = false;
+#if WITH_EDITOR
+void ULXRDetectionComponent::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+	UE_LOG(LogLXR, Warning, TEXT("%s"), *PropertyChangedEvent.GetPropertyName().ToString());
+
+	FName MemberPropertyName = (PropertyChangedEvent.MemberProperty != nullptr) ? PropertyChangedEvent.MemberProperty->GetFName() : NAME_None;
+	FName PropertyName = (PropertyChangedEvent.Property != nullptr) ? PropertyChangedEvent.Property->GetFName() : NAME_None;
+
+	if (PropertyName == GET_MEMBER_NAME_CHECKED(ThisClass, RelevancyCheckQuality) || PropertyName == GET_MEMBER_NAME_CHECKED(ThisClass, VisibilityCheckQuality))
+	{
+		SetParamsByQualityLevels();
+	}
+
+	if (PropertyName == GET_MEMBER_NAME_CHECKED(ThisClass, SocketPreset))
+	{
+		if (SocketPreset < ESocketPreset::Custom)
+			TargetSockets = *GetPresetSockets(SocketPreset);
+	}
+
+
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+}
+#endif
+
+// Sets default values for this component's properties
+ULXRDetectionComponent::ULXRDetectionComponent(): CombinedLXRColor(), CombinedLXRIntensity(0), AsyncEnabledAtStart(false), LastRelevancyUpdateLocation(), Replicated_DetectedLightIntensity(0),
+                                                  Replicated_DetectedLightColor(), CombinedLXRColorTarget(),
+                                                  CombinedLXRIntensityTarget(0)
+{
+	// Set this component to be initialized when the game starts, and to be ticked every frame.  You can turn these features
+	// off to improve performance if you don't need them.
+	PrimaryComponentTick.bCanEverTick = true;
+
+	// ...
+}
+
+void ULXRDetectionComponent::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(ULXRDetectionComponent, Replicated_DetectedLightIntensity)
+	DOREPLIFETIME(ULXRDetectionComponent, Replicated_DetectedLightColor)
+}
+
+// Called when the game starts
+void ULXRDetectionComponent::BeginPlay()
+{
+	Super::BeginPlay();
+	SetIsReplicated(bUserServerAuthority);
+
+	DetectionTaskData = MakeShared<FDetectionTaskData>();
+	RelevancyPassedData = MakeShared<FLightSourcePassedData>();
+	RelevancyTaskData = MakeShared<FTraceTaskData>();
+	DetectionTaskData->Instigator = GetOwner();
+
+	if (GetWorld()->IsPreviewWorld())
+	{
+		SetComponentTickEnabled(false);
+		return;
+	}
+
+	DetectionTaskData->DetectionComponent = this;
+	DetectionTaskData->TraceChannel = TraceChannel;
+
+	AsyncEnabledAtStart = VisibilityCheckType == ETaskProcessType::Multithread;
+	SetComponentTickEnabled(false);
+
+	if (RelevancyTargetType == ETraceTarget::Sockets || VisibilityTargetType == ETraceTarget::Sockets)
+	{
+		if (SocketPreset < ESocketPreset::Custom)
+			TargetSockets = *GetPresetSockets(SocketPreset);
+
+		if (TargetSockets.Num() > 0)
+		{
+			if (SkeletalMeshComponent.ComponentProperty.IsNone())
+				RealSkeletalMeshComponent = GetOwner()->FindComponentByClass<USkeletalMeshComponent>();
+			else
+			{
+				RealSkeletalMeshComponent = Cast<USkeletalMeshComponent>(SkeletalMeshComponent.GetComponent(GetOwner()));
+			}
+
+			ensureMsgf(RealSkeletalMeshComponent, TEXT("SkeletalMeshComponent does not exists on %s"), *GetOwner()->GetName());
+
+			int Index = 0;
+			if (RealSkeletalMeshComponent)
+			{
+				TArray<FName> Keys;
+				TargetSockets.GetKeys(Keys);
+				for (FName Socket : Keys)
+				{
+					if (!RealSkeletalMeshComponent->DoesSocketExist(Socket))
+					{
+						UE_LOG(LogLXR, Warning, TEXT("Socket %s does not exist on %s"), *Socket.ToString(), *GetOwner()->GetName())
+						continue;
+					}
+					CachedSockets.Add(Socket);
+					SocketNameToTraceTarget.Add(Socket, Index);
+					TraceTargetToSocketName.Add(Index, Socket);
+					Index++;
+				}
+			}
+		}
+	}
+
+	SetParamsByQualityLevels();
+
+	//Lazy "late begin play"
+	FTimerHandle Temp;
+	LXRSubsystem = GetOwner()->GetWorld()->GetSubsystem<ULXRSubsystem>();
+	GetWorld()->GetTimerManager().SetTimer(Temp, FTimerDelegate::CreateLambda([&]
+	{
+		if (RelevancyCheckType == ERelevancyCheckType::Octree)
+		{
+			if (!LXRSubsystem->GetOctree().IsValid())
+			{
+				UE_LOG(LogLXR, Error, TEXT("%s RelevancyCheckType == Octree but OctreeActor not found in level"), *GetOwner()->GetName());
+				UE_LOG(LogLXR, Error, TEXT("Reverting RelevancyCheckType to Smart for %s"), *GetOwner()->GetName());
+				RelevancyCheckType = ERelevancyCheckType::Smart;
+			}
+		}
+
+
+		MemoryComponent = GetOwner()->FindComponentByClass<ULXRMemoryComponent>();
+		if (IsValid(MemoryComponent))
+		{
+			DetectionTaskData->IsLightMemoryEnabled = true;
+		}
+
+		LXRSubsystem->RegisterDetection(this);
+		GetLightSystemLights();
+		if (RelevancyCheckType != ERelevancyCheckType::Octree)
+		{
+			LXRSubsystem->OnLightAdded.AddUObject(this, &ULXRDetectionComponent::AddLight);
+			LXRSubsystem->OnLightRemoved.AddUObject(this, &ULXRDetectionComponent::RemoveLight);
+		}
+		bool bSoloFound = GetWorld()->GetSubsystem<ULXRSubsystem>()->bSoloFound;
+
+		for (int i = 0; i < AllLights.Num(); ++i)
+		{
+			if (auto SourceComponent = Cast<ULXRSourceComponent>(AllLights[i]))
+			{
+				if (SourceComponent->bAlwaysRelevant)
+				{
+					if (bSoloFound)
+					{
+						if (SourceComponent->bSolo)
+						{
+							DetectionTaskData->RelevantLights.Add(AllLights[i]);
+						}
+						continue;
+					}
+					DetectionTaskData->RelevantLights.Add(AllLights[i]);
+				}
+			}
+		}
+
+		switch (RelevancyCheckType)
+		{
+		case ERelevancyCheckType::Fixed:
+			{
+				CheckAllLightForRelevancy();
+				break;
+			}
+		case ERelevancyCheckType::Smart:
+			{
+				for (int i = 0; i < AllLights.Num(); ++i)
+				{
+					const ELightArrayType SmartArrayType = GetSmartArrayTypeForLightFromSqrDistance(FVector::DistSquared(AllLights[i].Get()->GetOwner()->GetActorLocation(), GetOwner()->GetActorLocation()));
+					AddToSmartArrayBySmartArrayType(SmartArrayType, *AllLights[i]);
+				}
+				break;
+			}
+		case ERelevancyCheckType::Octree:
+			break;
+		default: ;
+		}
+
+		SetComponentTickEnabled(true);
+	}), 0.1f, false);
+
+	GetWorld()->GetTimerManager().SetTimer(CheckAllLightsTimerHandle, FTimerDelegate::CreateUObject(this, &ULXRDetectionComponent::CheckAllLightForRelevancy), RelevancyCheckRate, true, 0.15);
+
+#if UE_ENABLE_DEBUG_DRAWING
+	if (bDebugVectorArray)
+	{
+		for (FVector& TargetVector : TargetVectors)
+		{
+			DrawDebugSphere(GetWorld(), GetOwner()->GetActorTransform().TransformPosition(TargetVector), 10, 12, FColor::Green, false, 5.f);
+		}
+	}
+#endif
+	// if (bGetIlluminatedTargets)
+	// {
+	// 	TArray<FVector> TraceTargets = GetTraceTargets(true);
+	// 	for (int i = 0; i < TraceTargets.Num(); ++i)
+	// 	{
+	// 		IlluminatedTargets.Add(i);
+	// 		TargetsCombinedLXRIntensity.Add(i);
+	// 		TargetsCombinedLuxIntensity.Add(i);
+	// 		TargetsCombinedLXRColor.Add(i);
+	// 		TargetsCombinedLightColors.Add(i);
+	// 	}
+	// }
+
+	//Force update on next tick.
+}
+
+void ULXRDetectionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	Super::EndPlay(EndPlayReason);
+
+	if (GetWorld()->IsPreviewWorld())
+	{
+		return;
+	}
+
+	LXRSubsystem->OnLightAdded.RemoveAll(this);
+	LXRSubsystem->OnLightRemoved.RemoveAll(this);
+	LXRSubsystem->UnregisterDetection(this);
+}
+
+void ULXRDetectionComponent::TickComponent(float DeltaTime, ELevelTick Tick, FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, Tick, ThisTickFunction);
+	if (!IsValid(GetOwner())) return;
+
+	if (DetectionTaskData == nullptr) return;
+
+	if (!bUserServerAuthority)
+	{
+		DoCalculation = true;
+	}
+	else
+	{
+		if (bUseClientSideCalculation)
+		{
+			DoCalculation = true;
+		}
+		else if (GetOwner()->HasAuthority())
+		{
+			DoCalculation = true;
+		}
+	}
+
+	if (DoCalculation)
+	{
+		if (DetectionTaskData->RelevantLights.Num() > 0)
+		{
+			ProcessDetectionTask();
+		}
+		else
+		{
+			DetectionTaskData->Analyze = true;
+		}
+
+		DetectionTaskData->CheckAndRemoveNonRelevantLights();
+		DetectionTaskData->CheckAndAddNewRelevantLights();
+
+		if (DetectionTaskData->Analyze)
+		{
+			GetLXR();
+			DetectionTaskData->Analyze = false;
+		}
+	}
+	else
+	{
+		if (bUserServerAuthority && !GetOwner()->HasAuthority())
+		{
+			Client_InterpolateCombinedColorTowardsReplicatedColor();
+			Client_InterpolateCombinedIntensityTowardsReplicatedIntensity();
+		}
+	}
+}
+
+void ULXRDetectionComponent::OnRep_Replicated_DetectedLightIntensity()
+{
+	if (bUserServerAuthority && bUseClientSideCalculation)
+	{
+		CombinedLXRIntensity = Replicated_DetectedLightIntensity;
+	}
+}
+
+void ULXRDetectionComponent::OnRep_Replicated_DetectedLightColor()
+{
+	if (bUserServerAuthority && bUseClientSideCalculation)
+	{
+		CombinedLXRColor = Replicated_DetectedLightColor;
+	}
+}
+
+void ULXRDetectionComponent::ProcessDetectionTask()
+{
+	if (DetectionTaskData->Processing || DetectionTaskData->Analyze) return;
+	if (DetectionTaskData->TargetIterator == INDEX_NONE || DetectionTaskData->TracePoints.Num() == 0)
+	{
+		DetectionTaskFinished();
+		return;
+	}
+
+	DetectionTaskData->DecreaseSourcesRefTimer();
+
+	switch (VisibilityCheckType)
+	{
+	case ETaskProcessType::Sync:
+		DetectionTaskData->IsBackgroundThread = false;
+		(new FAutoDeleteAsyncTask<FProcessDetectionTaskAsyncTask>(DetectionTaskData))->StartSynchronousTask();
+
+		break;
+	case ETaskProcessType::Multithread:
+		DetectionTaskData->IsBackgroundThread = true;
+		(new FAutoDeleteAsyncTask<FProcessDetectionTaskAsyncTask>(DetectionTaskData))->StartBackgroundTask();
+		break;
+	}
+}
+
+void ULXRDetectionComponent::DetectionTaskFinished()
+{
+	for (auto& Element : DetectionTaskData->PassedDatas)
+	{
+		if (!DetectionTaskData->IsSourceStillRelevant(Element.SourceComponent))
+		{
+			DetectionTaskData->RelevantLightsToRemove.Add(Element.SourceComponent);
+		}
+
+		if (Element.SourceComponent->bAddDetected && bAddToSourceWhenDetected)
+		{
+			if (Element.SourceComponent->DetectedActors.Contains(GetOwner()))
+			{
+				Element.SourceComponent->DetectedActors.RemoveSwap(GetOwner());
+			}
+		}
+	}
+
+	DetectionTaskData->TracePoints.Reset();
+	DetectionTaskData->TracePoints = GetTraceTargets(true);
+	DetectionTaskData->TargetIterator = DetectionTaskData->TracePoints.Num() - 1;
+	DetectionTaskData->GeneratingTargets = false;
+	DetectionTaskData->TaskLock = false;
+	DetectionTaskData->Processing = false;
+	DetectionTaskData->Analyze = true;
+}
+
+
+ELightArrayType ULXRDetectionComponent::GetSmartArrayTypeForLight(const FVector& Start, const FVector& End) const
+{
+	const float DistSqr = FVector::DistSquared(Start, End);
+	return GetSmartArrayTypeForLightFromSqrDistance(DistSqr);
+}
+
+void ULXRDetectionComponent::AddToSmartArrayBySmartArrayType(ELightArrayType LightArrayType, ULXRSourceComponent& SourceComponent)
+{
+	switch (LightArrayType)
+	{
+	case ELightArrayType::SmartFar:
+		SmartFarLightsToAdd.AddUnique(&SourceComponent);
+		break;
+	case ELightArrayType::SmartMid:
+		SmartMidLightsToAdd.AddUnique(&SourceComponent);
+		break;
+	case ELightArrayType::SmartNear:
+		SmartNearLightsToAdd.AddUnique(&SourceComponent);
+		break;
+	default: ;
+	}
+}
+
+int ULXRDetectionComponent::GetCurrentLightArrayIndexByLightArrayType(const ELightArrayType LightArrayType) const
+{
+	switch (LightArrayType)
+	{
+	case ELightArrayType::All:
+	case ELightArrayType::Octree:
+		return RelevancyLightIndex;
+
+	case ELightArrayType::Relevant:
+		return RelevantLightIndex;
+
+	case ELightArrayType::SmartFar:
+		return SmartFarLightIndex;
+
+	case ELightArrayType::SmartMid:
+		return SmartMidLightIndex;
+
+	case ELightArrayType::SmartNear:
+		return SmartNearLightIndex;
+
+	default: ;
+	}
+	return -1;
+}
+
+void ULXRDetectionComponent::SetCurrentLightArrayIndexByLightArrayType(int InIndex, const ELightArrayType LightArrayType)
+{
+	switch (LightArrayType)
+	{
+	case ELightArrayType::All:
+	case ELightArrayType::Octree:
+		RelevancyLightIndex = InIndex;
+		break;
+
+	case ELightArrayType::Relevant:
+		RelevantLightIndex = InIndex;
+		break;
+
+	case ELightArrayType::SmartFar:
+		SmartFarLightIndex = InIndex;
+		break;
+
+	case ELightArrayType::SmartMid:
+		SmartMidLightIndex = InIndex;
+		break;
+
+	case ELightArrayType::SmartNear:
+		SmartNearLightIndex = InIndex;
+		break;
+
+	default: ;
+	}
+}
+
+ELightArrayType ULXRDetectionComponent::GetSmartArrayTypeForLightFromSqrDistance(const float& SqrDist) const
+{
+	if (SqrDist > RelevancySmartDistanceMax * RelevancySmartDistanceMax)
+		return ELightArrayType::SmartFar;
+	if (SqrDist > RelevancySmartDistanceMin * RelevancySmartDistanceMin && SqrDist < RelevancySmartDistanceMax * RelevancySmartDistanceMax)
+		return ELightArrayType::SmartMid;
+
+	return ELightArrayType::SmartNear;
+}
+
+FCollisionQueryParams ULXRDetectionComponent::GetCollisionQueryParams(const TArray<AActor*>& ActorsToIgnore) const
+{
+	FCollisionQueryParams Params(GetOwner()->GetFName(), SCENE_QUERY_STAT_ONLY(KismetTraceUtils), false);
+
+	Params.AddIgnoredActors(ActorsToIgnore);
+	return Params;
+}
+
+
+void ULXRDetectionComponent::ChangeSmartLightArray(const ELightArrayType& From, const ELightArrayType& To, const TWeakObjectPtr<ULXRSourceComponent>& SourceComponent)
+{
+	if (From == To) return;
+	switch (To)
+	{
+	case ELightArrayType::SmartFar:
+		SmartFarLightsToAdd.AddUnique(SourceComponent);
+		break;
+	case ELightArrayType::SmartMid:
+		SmartMidLightsToAdd.AddUnique(SourceComponent);
+		break;
+	case ELightArrayType::SmartNear:
+		SmartNearLightsToAdd.AddUnique(SourceComponent);
+		break;
+	default: ;
+	}
+	switch (From)
+	{
+	case ELightArrayType::SmartFar:
+		SmartFarLightsToRemove.AddUnique(SourceComponent);
+		break;
+	case ELightArrayType::SmartMid:
+		SmartMidLightsToRemove.AddUnique(SourceComponent);
+		break;
+	case ELightArrayType::SmartNear:
+		SmartNearLightsToRemove.AddUnique(SourceComponent);
+		break;
+	default: ;
+	}
+}
+
+void ULXRDetectionComponent::CheckAllLightForRelevancy()
+{
+	if (bStop) return;
+
+	RemoveRedundantLights();
+	AddNewLights();
+
+	// if (!bUpdateOctreeLights)
+	// {
+	// 	if (bUseLocationChange)
+	// 	{
+	// 		if ((GetOwner()->GetActorLocation() - LastRelevancyUpdateLocation).Size() < RelevancyLocationThreshold)
+	// 			return;
+	// 	}
+	// }
+
+	SCOPE_CYCLE_COUNTER(STAT_RelevancyCheck);
+
+	TArray<int> StaleLightsIndexes;
+	TArray<TWeakObjectPtr<ULXRSourceComponent>> LightBatch;
+
+	switch (RelevancyCheckType)
+	{
+	case ERelevancyCheckType::Fixed:
+		{
+			if (!AllLights.IsValidIndex(RelevancyLightIndex))
+				RelevancyLightIndex = 0;
+
+			GetNextBatchByLightArrayType(LightBatch, ELightArrayType::All);
+			ProcessRelevancyCheckLightBatch(LightBatch, ELightArrayType::All);
+			break;
+		}
+
+	case ERelevancyCheckType::Smart:
+		{
+			for (int i = SmartFarLightsToRemove.Num() - 1; i >= 0; --i)
+			{
+				SmartFarLights.RemoveSwap(SmartFarLightsToRemove[i]);
+			}
+
+			for (int i = SmartMidLightsToRemove.Num() - 1; i >= 0; --i)
+			{
+				SmartMidLights.RemoveSwap(SmartMidLightsToRemove[i]);
+			}
+
+			for (int i = SmartNearLightsToRemove.Num() - 1; i >= 0; --i)
+			{
+				SmartNearLights.RemoveSwap(SmartNearLightsToRemove[i]);
+			}
+
+			for (int i = SmartFarLightsToAdd.Num() - 1; i >= 0; --i)
+			{
+				SmartFarLights.Add(SmartFarLightsToAdd[i]);
+			}
+
+			for (int i = SmartMidLightsToAdd.Num() - 1; i >= 0; --i)
+			{
+				SmartMidLights.Add(SmartMidLightsToAdd[i]);
+			}
+
+			for (int i = SmartNearLightsToAdd.Num() - 1; i >= 0; --i)
+			{
+				SmartNearLights.Add(SmartNearLightsToAdd[i]);
+			}
+
+			SmartFarLightsToRemove.Empty();
+			SmartMidLightsToRemove.Empty();
+			SmartNearLightsToRemove.Empty();
+			SmartFarLightsToAdd.Empty();
+			SmartMidLightsToAdd.Empty();
+			SmartNearLightsToAdd.Empty();
+
+			NearSmartTimer += RelevancyCheckRate;
+			NearSmartTimer += RelevancyCheckRate;
+			MidSmartTimer += RelevancyCheckRate;
+			FarSmartTimer += RelevancyCheckRate;
+
+			if (FarSmartTimer > 1 / RelevancySmartCheckRateDivider)
+			{
+				if (SmartFarLights.Num() > 0)
+				{
+					GetNextBatchByLightArrayType(LightBatch, ELightArrayType::SmartFar);
+					ProcessRelevancyCheckLightBatch(LightBatch, ELightArrayType::SmartFar);
+				}
+				FarSmartTimer = 0;
+			}
+
+			if (MidSmartTimer > 0.5 / RelevancySmartCheckRateDivider)
+			{
+				if (SmartMidLights.Num() > 0)
+				{
+					GetNextBatchByLightArrayType(LightBatch, ELightArrayType::SmartMid);
+					ProcessRelevancyCheckLightBatch(LightBatch, ELightArrayType::SmartMid);
+				}
+				MidSmartTimer = 0;
+			}
+
+
+			if (NearSmartTimer > 0.2 / RelevancySmartCheckRateDivider)
+			{
+				if (SmartNearLights.Num() > 0)
+				{
+					GetNextBatchByLightArrayType(LightBatch, ELightArrayType::SmartNear);
+					ProcessRelevancyCheckLightBatch(LightBatch, ELightArrayType::SmartNear);
+				}
+				NearSmartTimer = 0;
+			}
+
+			break;
+		}
+
+	case ERelevancyCheckType::Octree:
+		{
+			UpdateOctreeLights();
+			GetNextBatchByLightArrayType(LightBatch, ELightArrayType::Octree);
+			ProcessRelevancyCheckLightBatch(LightBatch, ELightArrayType::Octree);
+			// LXRSubsystem->UpdateElement(GetOwner());
+
+			break;
+		}
+
+	default: ;
+	}
+
+
+	LastRelevancyUpdateLocation = GetOwner()->GetActorLocation();
+
+	SET_DWORD_STAT(STAT_ALLLIGHTS, AllLights.Num());
+	SET_DWORD_STAT(STAT_SMARTNEAR, SmartNearLights.Num());
+	SET_DWORD_STAT(STAT_SMARTMID, SmartMidLights.Num());
+	SET_DWORD_STAT(STAT_SMARTFAR, SmartFarLights.Num());
+}
+
+void ULXRDetectionComponent::AddNewLightToRelevantList(const TWeakObjectPtr<ULXRSourceComponent>& SourceComponent)
+{
+	if (!DetectionTaskData->TaskLock)
+		DetectionTaskData->AddRelevantLight(SourceComponent);
+	else
+		DetectionTaskData->RelevantLightsToAdd.AddUnique(SourceComponent);
+
+	if (DebugOptions.bPrintDebug)
+		UE_LOG(LogLXR, VeryVerbose, TEXT("Added relevant light %s to %s"), *SourceComponent.Get()->GetOwner()->GetName(), *GetOwner()->GetName());
+}
+
+void ULXRDetectionComponent::ProcessRelevancyCheckLightBatch(TArray<TWeakObjectPtr<ULXRSourceComponent>>& LightBatch, ELightArrayType LightArrayType)
+{
+	switch (RelevancyCheckType)
+	{
+	case ERelevancyCheckType::Fixed:
+	case ERelevancyCheckType::Octree:
+
+		for (int i = 0; i < LightBatch.Num(); ++i)
+		{
+			TWeakObjectPtr<ULXRSourceComponent> LightSourceComponent = LightBatch[i];
+			if (LightSourceComponent.IsValid())
+			{
+				if (!DetectionTaskData->RelevantLights.Contains(LightSourceComponent))
+				{
+					bool bIsRelevant = LightSourceComponent->bAlwaysRelevant;
+					if (!bIsRelevant)
+					{
+						bIsRelevant = CheckDistance(LightSourceComponent);
+					}
+
+					if (bIsRelevant)
+					{
+						AddNewLightToRelevantList(LightBatch[i]);
+					}
+				}
+			}
+		}
+		break;
+
+	case ERelevancyCheckType::Smart:
+		{
+			switch (LightArrayType)
+			{
+			case ELightArrayType::SmartFar:
+
+				for (int i = 0; i < LightBatch.Num(); ++i)
+				{
+					TWeakObjectPtr<ULXRSourceComponent> LightSourceComponent = LightBatch[i];
+					if (LightSourceComponent.IsValid())
+					{
+#if UE_ENABLE_DEBUG_DRAWING
+						if (DebugOptions.bDebugRelevancy)
+						{
+							constexpr float Radius = 30;
+							constexpr float Thickness = 0;
+							const FColor Color = FColor::Magenta;
+							DrawDebugSphere(GetWorld(), LightSourceComponent->GetOwner()->GetActorLocation(), Radius, FMath::Clamp<int32>(Radius / 4.f, 8, 32), Color, false, 1 / RelevancySmartCheckRateDivider, 0,
+							                Thickness);
+						}
+#endif
+
+
+						const float DistSqr = FVector::DistSquared(LightSourceComponent->GetOwner()->GetActorLocation(), GetOwner()->GetActorLocation());
+						if (DistSqr < (RelevancySmartDistanceMax * RelevancySmartDistanceMax * LightSourceComponent->AttenuationMultiplierToBeRelevant))
+						{
+							const ELightArrayType NewType = GetSmartArrayTypeForLightFromSqrDistance(DistSqr);
+							ChangeSmartLightArray(ELightArrayType::SmartFar, NewType, LightBatch[i]);
+						}
+					}
+				}
+				break;
+
+
+			case ELightArrayType::SmartMid:
+
+				for (int i = 0; i < LightBatch.Num(); ++i)
+				{
+					TWeakObjectPtr<ULXRSourceComponent> LightSourceComponent = LightBatch[i];
+					if (LightSourceComponent.IsValid())
+					{
+#if UE_ENABLE_DEBUG_DRAWING
+						if (DebugOptions.bDebugRelevancy)
+						{
+							const float Radius = 30;
+							const float Thickness = 0;
+							const FColor Color = FColor::Yellow;
+							DrawDebugSphere(GetWorld(), LightSourceComponent->GetOwner()->GetActorLocation(), Radius, FMath::Clamp<int32>(Radius / 4.f, 8, 32), Color, false, 0.5 / RelevancySmartCheckRateDivider, 0,
+							                Thickness);
+						}
+#endif
+						const float DistSqr = FVector::DistSquared(LightSourceComponent->GetOwner()->GetActorLocation(), GetOwner()->GetActorLocation());
+						const ELightArrayType NewType = GetSmartArrayTypeForLightFromSqrDistance(DistSqr);
+
+						if (NewType != ELightArrayType::SmartMid)
+							ChangeSmartLightArray(ELightArrayType::SmartMid, NewType, LightSourceComponent);
+
+						if (NewType > ELightArrayType::SmartMid || NewType == ELightArrayType::SmartMid)
+						{
+							if (DistSqr < RelevancySmartDistanceMax * RelevancySmartDistanceMax * LightSourceComponent->AttenuationMultiplierToBeRelevant)
+							{
+								if (!DetectionTaskData->RelevantLights.Contains(LightSourceComponent))
+								{
+									bool bIsRelevant = LightSourceComponent->bAlwaysRelevant;
+
+									if (!bIsRelevant)
+									{
+										RelevancyTaskData->Reset(GetTraceTargets(false));
+										RelevancyTaskData->RelevancyRequiredAmountToPass = TargetsRequired < 1 ? RelevancyTaskData->ChosenTracePoints.Num() * TargetsRequired : TargetsRequired;
+
+										RelevancyPassedData->SourceComponent = LightSourceComponent;
+										bIsRelevant = ULXRFunctionLibrary::CheckIsLightRelevant(this, *RelevancyTaskData, *RelevancyPassedData, DebugOptions);
+									}
+
+									if (bIsRelevant)
+									{
+										SmartMidLightsToRemove.AddUnique(LightSourceComponent);
+										AddNewLightToRelevantList(LightSourceComponent);
+									}
+								}
+							}
+						}
+					}
+				}
+				break;
+
+			case ELightArrayType::SmartNear:
+
+				for (int i = 0; i < LightBatch.Num(); ++i)
+				{
+					TWeakObjectPtr<ULXRSourceComponent> LightSourceComponent = LightBatch[i];
+					if (LightSourceComponent.IsValid())
+					{
+#if UE_ENABLE_DEBUG_DRAWING
+						if (DebugOptions.bDebugRelevancy)
+						{
+							const float Radius = 30;
+							const float Thickness = 0;
+							const FColor Color = FColor::Cyan;
+							DrawDebugSphere(GetWorld(), LightSourceComponent->GetOwner()->GetActorLocation(), Radius, FMath::Clamp<int32>(Radius / 4.f, 8, 32), Color, false, 0.2 / RelevancySmartCheckRateDivider, 0,
+							                Thickness);
+						}
+#endif
+						const float DistSqr = FVector::DistSquared(LightSourceComponent->GetOwner()->GetActorLocation(), GetOwner()->GetActorLocation());
+						const ELightArrayType NewType = GetSmartArrayTypeForLightFromSqrDistance(DistSqr);
+
+						if (NewType != ELightArrayType::SmartNear)
+						{
+							ChangeSmartLightArray(ELightArrayType::SmartNear, NewType, LightBatch[i]);
+							continue;
+						}
+
+						if (!DetectionTaskData->RelevantLights.Contains(LightSourceComponent))
+						{
+							bool bIsRelevant = LightSourceComponent->bAlwaysRelevant;
+							if (!bIsRelevant)
+							{
+								RelevancyTaskData->Reset(GetTraceTargets(false));
+								RelevancyPassedData->SourceComponent = LightSourceComponent;
+								RelevancyTaskData->RelevancyRequiredAmountToPass = TargetsRequired < 1 ? RelevancyTaskData->ChosenTracePoints.Num() * TargetsRequired : TargetsRequired;
+								bIsRelevant = ULXRFunctionLibrary::CheckIsLightRelevant(this, *RelevancyTaskData, *RelevancyPassedData, DebugOptions);
+							}
+
+							if (bIsRelevant)
+							{
+								SmartNearLightsToRemove.AddUnique(LightBatch[i]);
+								AddNewLightToRelevantList(LightBatch[i]);
+							}
+						}
+					}
+				}
+				break;
+			default: ;
+			}
+		}
+	default: ;
+	}
+}
+
+// void ULXRDetectionComponent::DoRelevantCheckOnSourceActor(const TWeakObjectPtr<AActor>& LightSourceComponentOwner, const FTraceTaskData& TraceTaskData, bool IsFromThread, EDetectionType DetectionType)
+// {
+// 	if (!LightSourceComponentOwner.IsValid())
+// 		return;
+//
+// 	if (GetOwner() == LightSourceComponentOwner)
+// 		return;
+//
+// 	const ULXRSourceComponent* LightSourceComponent = Cast<ULXRSourceComponent>(LightSourceComponentOwner->GetComponentByClass(ULXRSourceComponent::StaticClass()));
+// 	const TArray<ULightComponent*> LightComponents = LightSourceComponent->GetMyLightComponents();
+// 	const bool IsLightSourceEnabled = LightSourceComponent->IsEnabled();
+// 	bool UpdateMemory = IsLightMemoryEnabled && LightSourceComponent->bIsMemorizable;
+// 	// const bool CheckOnlyIsRelevant = DetectionType == EDetectionType::Environment;
+// 	if (LXRSubsystem->bSoloFound)
+// 	{
+// 		if (!LightSourceComponent->bSolo)
+// 			return;
+// 	}
+//
+// 	FQueryLXRDebugOptions DebugOptions;
+// 	DebugOptions.bDebugRelevancy = bDrawDebug;
+// 	DebugOptions.bDebugVisibility = bDrawDebug;
+// 	DebugOptions.DebugVisibilityDrawTime = DebugDrawTime;
+// 	DebugOptions.DebugRelevancyDrawTime = DebugDrawTime;
+//
+//
+// 	bool IsRelevant = false;
+// 	FLightSourcePassedData PassedData = FLightSourcePassedData(LightSourceComponentOwner);
+// 	if (IsLightSourceEnabled || UpdateMemory)
+// 	{
+// 		IsRelevant = ULXRFunctionLibrary::CheckIsLightRelevant(this, TraceTaskData, PassedData, DebugOptions);
+// 	}
+//
+// 	if (IsRelevant)
+// 	{
+// 		if (ULXRFunctionLibrary::CheckVisibility(this, TraceTaskData, PassedData, DebugOptions))
+//
+// 		{
+// 			if (IsLightSourceEnabled)
+// 			{
+// 				TArray<int> PassedComponentsAsArray = PassedData.GetAllComponentsAsArray();
+// 				IsFromThread ? LightPassedFromThread(LightSourceComponentOwner, PassedData) : AddPassedLight(LightSourceComponentOwner, PassedData);
+// 			}
+//
+// 			if (UpdateMemory && MemoryComponent->MemoryCheckClass == EMemoryCheckClass::Detection)
+// 			{
+// 				// UE_LOG(LogLXR, Warning, TEXT("Update state from Detection." ));
+// 				IsFromThread ? MemoryComponent->AddOrUpdateLightStateFromThread(LightSourceComponentOwner) : MemoryComponent->AddOrUpdateLightState(LightSourceComponentOwner);
+// 			}
+// 		}
+// 		else
+// 		{
+// 			PassedData.Clear();
+// 		}
+// 	}
+// 	if (!PassedData.IsValid())
+// 	{
+// 		if (LightSourceComponent->bAlwaysRelevant)
+// 		{
+// 			RemovePassedLight(LightSourceComponentOwner);
+// 		}
+// 		else
+// 		{
+// 			IsFromThread ? IncreaseFailCountIfNotAlwaysRelevantLightFromThread(LightSourceComponentOwner) : IncreaseFailCount(LightSourceComponentOwner);
+//
+// 			if (RelevantLightsFailCounts[LightSourceComponentOwner] > MaxConsecutiveFails)
+// 			{
+// 				IsFromThread ? CheckAndRemoveIfLightNotRelevantFromThread(LightSourceComponentOwner) : CheckAndRemoveIfLightNotRelevant(LightSourceComponentOwner);
+// 			}
+// 		}
+// 	}
+// }
+
+void ULXRDetectionComponent::GetLXR()
+{
+	SCOPE_CYCLE_COUNTER(STAT_GetCombinedDatas);
+	bool Reset = true;
+	if (DetectionTaskData->PassedDatas.Num() > 0 && DetectionTaskData->RelevantLights.Num() > 0)
+	{
+		// DrawDebugBox(GetWorld(), GetOwner()->GetActorLocation(), FVector(40), FColor::Green, false, GetComponentTickInterval());
+
+		// DetectionTaskData->TaskLock = true;
+		ULXRFunctionLibrary::GetLux(this, *DetectionTaskData, DetectionTaskData->PassedDatas, DetectionTaskData->TargetLXRData, DebugOptions);
+
+		if (DetectionTaskData->TargetLXRData.IlluminatedTargetsCount > 0)
+		{
+			CombinedLXRColorTarget = FLinearColor(ULXRFunctionLibrary::GetLinearColorArrayAverage(DetectionTaskData->TargetLXRData.GetAllTargetColorsAsArray()));
+			float MaxColor = ULXRFunctionLibrary::GetMaxOfColorChannels(CombinedLXRColor);
+
+			float LuxToReturn = 0;
+			switch (LuxReturnType)
+			{
+			case ELuxReturnType::AverageByTargets:
+				LuxToReturn = GetWeightedAverage
+					              ? DetectionTaskData->TargetLXRData.GetWeightedAverageLuxFromAllTargets(WeightedMinLuxThreshold, WeightToUseAboveMinLuxThreshold)
+					              : DetectionTaskData->TargetLXRData.GetAverageLuxFromAllTargets();
+				break;
+			case ELuxReturnType::AverageByPassedTargets:
+				LuxToReturn = GetWeightedAverage
+					              ? DetectionTaskData->TargetLXRData.GetWeightedAverageLuxFromPassedTargets(WeightedMinLuxThreshold, WeightToUseAboveMinLuxThreshold)
+					              : DetectionTaskData->TargetLXRData.GetAverageLuxFromPassedTargets();
+				break;
+			case ELuxReturnType::MaxOfPassedTargets:
+				LuxToReturn = DetectionTaskData->TargetLXRData.GetMaxLux();
+				break;
+			case ELuxReturnType::WeightedSocketImportance:
+				LuxToReturn = DetectionTaskData->TargetLXRData.GetSocketWeightedLux(*this);
+				break;
+			}
+			CombinedLXRIntensityTarget = LuxToReturn;
+			Reset = false;
+		}
+	}
+
+	if (Reset)
+	{
+		CombinedLXRColorTarget = FLinearColor::Black;
+		CombinedLXRIntensityTarget = 0;
+	}
+
+	float SmoothSpeed = CombinedLXRIntensityTarget < CombinedLXRIntensity ? 10000.f : LuxValueSmoothSpeed * 2;
+	CombinedLXRColor = FLinearColor(FMath::VInterpConstantTo(FVector(CombinedLXRColor), FVector(CombinedLXRColorTarget), GetWorld()->DeltaTimeSeconds, SmoothSpeed));
+	CombinedLXRIntensity = FMath::FInterpConstantTo(CombinedLXRIntensity, CombinedLXRIntensityTarget, GetWorld()->DeltaTimeSeconds, SmoothSpeed);
+
+	if (bUserServerAuthority)
+	{
+		if (GetOwner()->HasAuthority())
+		{
+			if (FMath::Abs(CombinedLXRIntensity - Replicated_DetectedLightIntensity) >= IntensityUpdateTolerance)
+			{
+				Replicated_DetectedLightIntensity = CombinedLXRIntensity;
+			}
+
+			if (CombinedLXRColor.Equals(Replicated_DetectedLightColor, ColorUpdateTolerance))
+			{
+				Replicated_DetectedLightColor = CombinedLXRColor;
+			}
+		}
+	}
+
+
+#if UE_ENABLE_DEBUG_DRAWING
+	if (DebugOptions.bDebugLXR)
+	{
+		ULXRFunctionLibrary::DebugOnGameThread([Weak = MakeWeakObjectPtr(this)]
+		{
+			if (Weak.IsValid())
+			{
+				auto SafeThis = Weak.Get();
+				FVector loc = SafeThis->GetOwner()->GetActorLocation() + SafeThis->GetOwner()->GetActorRightVector() * -50 + (FVector::UpVector * 100);
+				DrawDebugPoint(SafeThis->GetWorld(), loc, 15.f, SafeThis->CombinedLXRColor.ToFColor(true), false, 0.1f);
+				DrawDebugPoint(SafeThis->GetWorld(), loc, 15.f, SafeThis->CombinedLXRColor.ToFColor(true), false, 0.1f);
+			}
+		});
+	}
+#endif
+}
+
+void ULXRDetectionComponent::Client_InterpolateCombinedIntensityTowardsReplicatedIntensity()
+{
+	if (!GetOwner()->HasAuthority())
+	{
+		CombinedLXRIntensity = FMath::FInterpTo(CombinedLXRIntensity, Replicated_DetectedLightIntensity, GetWorld()->DeltaTimeSeconds, 8.f);
+	}
+}
+
+void ULXRDetectionComponent::Client_InterpolateCombinedColorTowardsReplicatedColor()
+{
+	if (!GetOwner()->HasAuthority())
+	{
+		CombinedLXRColor = FLinearColor(FMath::VInterpConstantTo(FVector(CombinedLXRColor), FVector(Replicated_DetectedLightColor), GetWorld()->DeltaTimeSeconds, 8.f));
+	}
+}
+
+// void ULXRDetectionComponent::ProcessRelevantCheckLightBatch(TArray<TWeakObjectPtr<AActor>>& LightBatch, EDetectionType DetectionType)
+// {
+// 	FTraceTaskData TraceTaskData = FTraceTaskData(GetTraceTargets(true));
+// 	TraceTaskData.TraceType = EDetectionType::Detection;
+//
+// 	for (TWeakObjectPtr<AActor> LightSourceComponentOwner : LightBatch)
+// 	{
+// 		DoRelevantCheckOnSourceActor(LightSourceComponentOwner, TraceTaskData, false, DetectionType);
+// 	}
+// }
+
+// void ULXRDetectionComponent::CheckRelevantLights()
+// {
+// 	if (bStop) return;
+//
+// 	StatResetTimer += GetComponentTickInterval();
+// 	GetCombinedDatasTimer += GetComponentTickInterval();
+//
+// 	if (StatResetTimer > 1)
+// 	{
+// 		SET_DWORD_STAT(STAT_TRACESSYNC, 0);
+// 		SET_DWORD_STAT(STAT_TRACESMULTITHREAD, 0);
+// 		SET_DWORD_STAT(STAT_THREADS, 0);
+//
+// 		StatResetTimer = 0;
+// 	}
+//
+// 	// GEngine->AddOnScreenDebugMessage(324825, 0.1f, FColor::Blue, FString::Printf(TEXT("TickInterval %f"), GetComponentTickInterval()));
+// 	// GEngine->AddOnScreenDebugMessage(324823, 0.1f, FColor::Green, FString::Printf(TEXT("PLOP %f"), GetCombinedDatasTimer));
+//
+// 	if (GetCombinedDatasTimer > 0.1f)
+// 	{
+// 		// ULXRFunctionLibrary::GetLXR(this,traceta)
+// 		GetLXR();
+//
+// 		GetCombinedDatasTimer = 0;
+// 	}
+//
+// 	SCOPE_CYCLE_COUNTER(STAT_RelevantCheck);
+//
+// 	if (bPrintDebug)
+// 	{
+// 		GEngine->AddOnScreenDebugMessage(uint64(this) + 97, GetWorld()->DeltaTimeSeconds, FColor::Green, FString::Printf(TEXT("Relevant Lights: %d"), RelevantLights.Num()));
+// 		GEngine->AddOnScreenDebugMessage(uint64(this) + 98, GetWorld()->DeltaTimeSeconds, FColor::Green, FString::Printf(TEXT("Passed Lights: %d"), RelevantLightsPassed.Num()));
+// 		GEngine->AddOnScreenDebugMessage(uint64(this) + 99, GetWorld()->DeltaTimeSeconds, FColor::Green, FString::Printf(TEXT("All Lights: %d"), AllLights.Num()));
+// 	}
+//
+// #if UE_ENABLE_DEBUG_DRAWING
+// 	if (bDebugRelevantAndPassed)
+// 	{
+// 		for (auto RelevantLight : RelevantLights)
+// 		{
+// 			if (RelevantLight.IsValid())
+// 			{
+// 				DrawDebugBox(GetWorld(), RelevantLight->GetActorLocation(), FVector(25), FColor::Orange, false, GetComponentTickInterval());
+// 				DrawDebugDirectionalArrow(GetWorld(), GetOwner()->GetActorLocation(), RelevantLight->GetActorLocation(), 150, FColor::Orange, false, GetComponentTickInterval(), 0, 0);
+// 			}
+// 		}
+// 		for (auto PassedLight : RelevantLightsPassed)
+// 		{
+// 			if (PassedLight.IsValid())
+// 			{
+// 				DrawDebugBox(GetWorld(), PassedLight->GetActorLocation(), FVector(15), FColor::Cyan, false, GetComponentTickInterval());
+// 				DrawDebugDirectionalArrow(GetWorld(), GetOwner()->GetActorLocation(), PassedLight->GetActorLocation(), 100, FColor::Cyan, false, GetComponentTickInterval(), 0, 0);
+// 			}
+// 		}
+// 	}
+// #endif
+//
+// 	RemoveNonRelevantLights();
+// 	AddNewRelevantLights();
+// 	TArray<TWeakObjectPtr<AActor>> LightBatch;
+// 	GetNextRelevantCheckLightBatch(LightBatch);
+//
+// 	switch (RelevantCheckType)
+// 	{
+// 	case ETaskProcessType::Sync:
+// 		ProcessRelevantCheckLightBatch(LightBatch);
+// 		break;
+//
+// 	case ETaskProcessType::Multithread:
+// 		(new FAutoDeleteAsyncTask<FRelevantLightCheckAsyncTask>(this, GetWorld(), LightBatch, TraceChannel, EDetectionType::Detection))->StartBackgroundTask();
+// 		break;
+//
+// 	default: ;
+// 	}
+//
+// 	SET_DWORD_STAT(STAT_RELEVANTLIGHTS, RelevantLights.Num());
+// 	SET_DWORD_STAT(STAT_PASSEDRELEVANTLIGHTS, RelevantLightsPassed.Num());
+// }
+
+
+TArray<TWeakObjectPtr<ULXRSourceComponent>>& ULXRDetectionComponent::GetLightArrayByLightArrayType(ELightArrayType LightArrayType)
+{
+	switch (LightArrayType)
+	{
+	case ELightArrayType::All:
+		return AllLights;
+
+	case ELightArrayType::Relevant:
+		return DetectionTaskData->RelevantLights;
+
+	case ELightArrayType::SmartFar:
+		return SmartFarLights;
+
+	case ELightArrayType::SmartMid:
+		return SmartMidLights;
+
+	case ELightArrayType::SmartNear:
+		return SmartNearLights;
+
+	case ELightArrayType::Octree:
+		return RelevantOctreeLights;
+
+	default: ;
+	}
+
+	return AllLights;
+}
+
+void ULXRDetectionComponent::GetNextBatchByLightArrayType(TArray<TWeakObjectPtr<ULXRSourceComponent>>& OutLightBatch, ELightArrayType LightArrayType)
+{
+	const bool bIsRelevancyCheck = LightArrayType < ELightArrayType::Relevant;
+	const int& BatchCount = bIsRelevancyCheck ? RelevancyLightBatchCount : VisibilityLightBatchCount;
+	TArray<TWeakObjectPtr<ULXRSourceComponent>>& Array = GetLightArrayByLightArrayType(LightArrayType);
+	OutLightBatch.Empty();
+
+	int Index = GetCurrentLightArrayIndexByLightArrayType(LightArrayType);
+	//GEngine->AddOnScreenDebugMessage(1, GetWorld()->DeltaTimeSeconds, FColor::Red, FString::Printf(TEXT("Start")));
+	if (!Array.IsValidIndex(Index))
+		Index = Array.Num() - 1;
+
+	if (Array.Num() == 0)
+		Index = -1;
+
+	const int MaxIteration = Array.Num() > BatchCount ? Array.Num() * 2 : Array.Num();
+	int Iteration = 0;
+
+	while (OutLightBatch.Num() != BatchCount && Iteration < MaxIteration)
+	{
+		if (Index == -1)
+		{
+			Index = Array.Num() - 1;
+		}
+
+		if (!Array[Index].IsValid())
+		{
+			Array.RemoveAtSwap(Index);
+			Iteration++;
+			Index--;
+			continue;
+		}
+
+		if (LXRSubsystem->bSoloFound)
+		{
+			const ULXRSourceComponent* LightSourceComponent = Cast<ULXRSourceComponent>(Array[Index]);
+			if (LightSourceComponent->bSolo)
+			{
+				OutLightBatch.AddUnique(Array[Index]);
+			}
+		}
+		else
+		{
+			OutLightBatch.AddUnique(Array[Index]);
+		}
+
+		Iteration++;
+		Index--;
+	}
+
+	// if(LightArrayType==ELightArrayType::SmartMid || LightArrayType==ELightArrayType::SmartFar)
+	// for (auto actor : OutLightBatch)
+	// {
+	// 	UE_LOG(LogLXR, Verbose, TEXT("In Batch %s"), *actor->GetName());
+	// }
+	SetCurrentLightArrayIndexByLightArrayType(Index, LightArrayType);
+}
+
+// void ULXRDetectionComponent::GetNextRelevantCheckLightBatch(TArray<TWeakObjectPtr<AActor>>& OutLightBatch)
+// {
+// 	if (!RelevantLights.IsValidIndex(RelevantLightIndex))
+// 		RelevantLightIndex = RelevantLights.Num() - 1;
+//
+// 	if (RelevantLights.Num() == 0)
+// 	{
+// 		RelevantLightIndex = -1;
+// 		return;
+// 	}
+//
+// 	for (RelevantLightIndex; RelevantLightIndex >= 0; --RelevantLightIndex)
+// 	{
+// 		if (!RelevantLights[RelevantLightIndex].IsValid())
+// 		{
+// 			RelevantLights.RemoveAtSwap(RelevantLightIndex);
+// 			continue;
+// 		}
+//
+// 		if (RelevantLights[RelevantLightIndex] == GetOwner())
+// 			continue;
+//
+// 		OutLightBatch.AddUnique(RelevantLights[RelevantLightIndex]);
+// 		if (OutLightBatch.Num() == RelevantLightBatchCount)
+// 			break;
+// 	}
+//
+//
+// 	if (OutLightBatch.Num() != RelevantLightBatchCount && RelevantLightIndex == -1 && RelevantLights.Num() < RelevantLightBatchCount)
+// 	{
+// 		for (RelevantLightIndex = RelevantLights.Num() - 1; RelevantLightIndex >= 0; --RelevantLightIndex)
+// 		{
+// 			if (RelevantLights[RelevantLightIndex].IsValid())
+// 			{
+// 				OutLightBatch.AddUnique(RelevantLights[RelevantLightIndex]);
+// 				RelevantLightIndex--;
+// 				if (OutLightBatch.Num() == RelevantLightBatchCount)
+// 					break;
+// 			}
+// 		}
+// 	}
+// }
+
+
+// bool ULXRDetectionComponent::CheckDirectionalLight(const ULightComponent& LightComponent, const FVector& Start) const
+// {
+// 	const FVector DirectionalForwardInverse = LightComponent.GetForwardVector() * -1;
+// 	const FVector End = Start + DirectionalForwardInverse.GetSafeNormal() * static_cast<double>(DirectionalLightTraceDistance);
+//
+// 	TArray<AActor*> ActorsToIgnore;
+//
+// 	ActorsToIgnore.Append(Cast<ULXRSourceComponent>(LightComponent.GetOwner()->GetComponentByClass(ULXRSourceComponent::StaticClass()))->GetMyOverlappingActors());
+// 	ActorsToIgnore.Append(Cast<ULXRSourceComponent>(LightComponent.GetOwner()->GetComponentByClass(ULXRSourceComponent::StaticClass()))->GetIgnoreVisibilityActors());
+// 	ActorsToIgnore.Append(IgnoreVisibilityActors);
+//
+// 	ActorsToIgnore.AddUnique(GetOwner());
+// 	ActorsToIgnore.AddUnique(LightComponent.GetOwner());
+//
+// 	if (!GetWorld()->LineTraceTestByChannel(Start, End, TraceChannel, GetCollisionQueryParams(ActorsToIgnore)))
+// 	{
+// #if UE_ENABLE_DEBUG_DRAWING
+// 		if (bDrawDebug && Cast<ULXRSourceComponent>(LightComponent.GetOwner()->GetComponentByClass(ULXRSourceComponent::StaticClass()))->bDrawDebug)
+// 			DrawDebugLine(GetWorld(), Start, End, FColor::Green, false, DebugDrawTime, 0, 1);
+// #endif
+//
+// 		return true;
+// 	}
+// #if UE_ENABLE_DEBUG_DRAWING
+// 	if (bDrawDebug && Cast<ULXRSourceComponent>(LightComponent.GetOwner()->GetComponentByClass(ULXRSourceComponent::StaticClass()))->bDrawDebug)
+// 		DrawDebugLine(GetWorld(), Start, End, FColor::Red, false, DebugDrawTime, 0, 1);
+// #endif
+// 	return false;
+// }
+//
+bool ULXRDetectionComponent::CheckDistance(TWeakObjectPtr<ULXRSourceComponent> LightSourceComponent) const
+{
+	if (!LightSourceComponent.IsValid()) return false;
+	float Attenuation = 0;
+	const FVector& Start = GetOwner()->GetActorLocation();
+	const FVector& End = LightSourceComponent.Get()->GetOwner()->GetActorLocation();
+
+	TArray<ULightComponent*> SourceLightComponents = LightSourceComponent.Get()->GetMyLightComponents();
+
+	for (ULightComponent* ItLightComponent : SourceLightComponents)
+	{
+		if (ULocalLightComponent* LocalLightComponent = Cast<ULocalLightComponent>(ItLightComponent))
+		{
+			Attenuation = FMath::Max(LocalLightComponent->AttenuationRadius, Attenuation);
+		}
+	}
+	const float DistanceToCheck = Attenuation * LightSourceComponent.Get()->AttenuationMultiplierToBeRelevant;
+	const float DistanceSqr = FVector::DistSquared(Start, End);
+
+	if (DistanceSqr < DistanceToCheck * DistanceToCheck)
+		return true;
+	return false;
+}
+
+
+void ULXRDetectionComponent::GetLightSystemLights()
+{
+	AllLights = LXRSubsystem->GetAllLights();
+}
+
+void ULXRDetectionComponent::AddLight(ULXRSourceComponent* LightSource)
+{
+	if (LXRSubsystem)
+		NewAllLightsToAdd.AddUnique(LightSource);
+}
+
+void ULXRDetectionComponent::RemoveLight(ULXRSourceComponent* LightSource)
+{
+	LightsToRemove.AddUnique(LightSource);
+}
+
+bool ULXRDetectionComponent::GetIsRelevant(ULXRSourceComponent& LightSourceComponent) const
+{
+	return DetectionTaskData->RelevantLights.Contains(&LightSourceComponent);
+}
+
+void ULXRDetectionComponent::UpdateOctreeLights()
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE_STR("Do fancy Octree work");
+	OctreeLightsToAdd.Empty();
+	OctreeLightsToRemove.Empty();
+
+	OctreeBoundsTestObject.Center = GetOwner()->GetActorLocation();
+	OctreeBoundsTestObject.Extent = FVector4(FVector(RelevancyOctreeCheckBoundsSize));
+	{
+		LXRSubsystem->GetOctree()->FindElementsWithBoundsTest(OctreeBoundsTestObject, [this](const FLXROctreeElement& Element)
+		{
+			if (Element.GetOwner() == GetOwner() || Element.Data->OctreeElementType == Detection) return;
+			if (Element.Data.Get().TreeActor.IsValid())
+			{
+				const TWeakObjectPtr<ULXRSourceComponent> SourceComponent = Element.Data.Get().SourceComponent;
+				NearbyOctreeLights.AddUnique(SourceComponent);
+				OctreeLightsToAdd.AddUnique(SourceComponent);
+			}
+		});
+	}
+
+	for (int i = RelevantOctreeLights.Num() - 1; i >= 0; --i)
+	{
+		if (!NearbyOctreeLights.Contains(RelevantOctreeLights[i]))
+		{
+			OctreeLightsToRemove.Add(RelevantOctreeLights[i]);
+		}
+	}
+
+#if UE_ENABLE_DEBUG_DRAWING
+	if (bDebugOctreeLights)
+	{
+		GEngine->AddOnScreenDebugMessage(uint64(this) + 52, 1.f, FColor::Magenta, FString::Printf(TEXT("Octree Lights: %d"), NearbyOctreeLights.Num()));
+		for (TWeakObjectPtr OctreeLight : NearbyOctreeLights)
+		{
+			if (OctreeLight.IsValid())
+			{
+				DrawDebugDirectionalArrow(GetWorld(), GetOwner()->GetActorLocation(), OctreeLight->GetOwner()->GetActorLocation(), 150, FColor::Orange, false, RelevancyCheckRate, 0, 0);
+			}
+		}
+
+		for (TWeakObjectPtr OctreeLight : RelevantOctreeLights)
+		{
+			if (OctreeLight.IsValid())
+			{
+				DrawDebugDirectionalArrow(GetWorld(), GetOwner()->GetActorLocation(), OctreeLight->GetOwner()->GetActorLocation(), 150, FColor::Emerald, false, RelevancyCheckRate, 0, 0);
+			}
+		}
+
+		TArray<FLXROctreeSemantics::FLXROctree::FNodeIndex> NodeIndexes;
+		TArray<FBoxCenterAndExtent> NodesBounds;
+		int elementCount = 0;
+
+
+		DebugOctreeCounter--;
+		if (DebugOctreeCounter == 0)
+		{
+			LXRSubsystem->GetOctree()->FindNodesWithPredicate(
+				[this, &NodesBounds](FLXROctreeSemantics::FLXROctree::FNodeIndex ParentNodeIndex, FLXROctreeSemantics::FLXROctree::FNodeIndex NodeIndex, const FBoxCenterAndExtent& NodeBounds)
+				{
+					NodesBounds.Add(NodeBounds);
+					return true;
+				}, [this,&elementCount, &NodeIndexes](FLXROctreeSemantics::FLXROctree::FNodeIndex ParentNodeIndex, FLXROctreeSemantics::FLXROctree::FNodeIndex NodeIndex, const FBoxCenterAndExtent& NodeBounds)
+				{
+					NodeIndexes.Add(NodeIndex);
+					FVector maxExtent = NodeBounds.Extent;
+					FVector center = NodeBounds.Center;
+
+					DrawDebugBox(GetWorld(), center, maxExtent, FColor::Blue, false, .5f);
+					// DrawDebugSphere(GetWorld(), center + maxExtent, 4.0f, 12, FColor::Green, false, 0.5f);
+					// DrawDebugSphere(GetWorld(), center - maxExtent, 4.0f, 12, FColor::Red, false, 0.5f);
+
+					TArrayView<const FLXROctreeElement> elements = LXRSubsystem->GetOctree()->GetElementsForNode(NodeIndex);
+
+					for (int i = 0; i < elements.Num(); i++)
+					{
+						// Draw debug boxes around elements
+						float max = elements[i].Bounds.BoxExtent.GetMax();
+						elementCount++;
+					}
+				});
+
+			for (int i = 0; i < NodeIndexes.Num(); ++i)
+			{
+				TArrayView<const FLXROctreeElement> Elements = LXRSubsystem->GetOctree()->GetElementsForNode(NodeIndexes[i]);
+				bool HasElements = Elements.Num() > 0;
+				DrawDebugBox(GetWorld(), NodesBounds[i].Center, NodesBounds[i].Extent, HasElements ? FColor::Green : FColor::Red, false, 0.5f, 0, HasElements ? 10 : 5);
+				for (auto Element : Elements)
+				{
+					if (!IsValid(Element.GetOwner())) continue;
+					float Max = Element.Bounds.BoxExtent.GetMax();
+					FVector MaxExtent = FVector(Max);
+					FVector Center = Element.Data.Get().TreeActor->GetOwner()->GetActorLocation();
+
+					DrawDebugBox(GetWorld(), Center, MaxExtent, FColor().Yellow, false, 0.5f);
+				}
+			}
+
+			//GEngine->AddOnScreenDebugMessage(20940, 1.f, FColor::Magenta, FString::Printf(TEXT("Octree Elements: %d"), elementCount));
+			DebugOctreeCounter = 10;
+		}
+	}
+#endif
+	for (int i = OctreeLightsToRemove.Num() - 1; i >= 0; --i)
+	{
+		RelevantOctreeLights.RemoveSwap(OctreeLightsToRemove[i]);
+	}
+
+	for (int i = OctreeLightsToAdd.Num() - 1; i >= 0; --i)
+	{
+		RelevantOctreeLights.Add(OctreeLightsToAdd[i]);
+	}
+
+	NearbyOctreeLights.Empty();
+	bUpdateOctreeLights = false;
+}
+
+void ULXRDetectionComponent::SetParamsByQualityLevels()
+{
+	if (RelevancyCheckQuality < ECheckQuality::Custom)
+	{
+		RelevancyCheckRate = 0.1;
+		RelevancySmartCheckRateDivider = 1;
+		RelevancySmartDistanceMax = 2500;
+		RelevancySmartDistanceMin = 1000;
+		RelevancyOctreeCheckBoundsSize = 2000;
+	}
+
+	if (VisibilityCheckQuality < ECheckQuality::Custom)
+	{
+		VisibilityLightCheckRate = 0.05f;
+	}
+
+	switch (RelevancyCheckType)
+	{
+	case ERelevancyCheckType::Fixed:
+		{
+			switch (RelevancyCheckQuality)
+			{
+			case ECheckQuality::Low:
+				RelevancyCheckRate *= 2;
+				break;
+			case ECheckQuality::Medium:
+				RelevancyCheckRate *= 1;
+				break;
+			case ECheckQuality::High:
+				RelevancyCheckRate *= 0.6;
+				break;
+			case ECheckQuality::Epic:
+				RelevancyCheckRate *= 0.25;
+
+				break;
+			case ECheckQuality::Custom:
+				break;
+			default: ;
+			}
+		}
+		break;
+	case ERelevancyCheckType::Smart:
+		{
+			switch (RelevancyCheckQuality)
+			{
+			case ECheckQuality::Low:
+				RelevancySmartCheckRateDivider *= 0.5;
+				RelevancySmartDistanceMin *= .5;
+				RelevancySmartDistanceMax *= .5;
+				break;
+			case ECheckQuality::Medium:
+				RelevancySmartCheckRateDivider *= 1;
+				RelevancySmartDistanceMin *= 1;
+				RelevancySmartDistanceMax *= 1;
+
+				break;
+			case ECheckQuality::High:
+				RelevancySmartCheckRateDivider *= 1.25;
+				RelevancySmartDistanceMin *= 1;
+				RelevancySmartDistanceMax *= 1.5;
+
+				break;
+			case ECheckQuality::Epic:
+				RelevancySmartCheckRateDivider *= 1.55;
+				RelevancySmartDistanceMin *= 1.5;
+				RelevancySmartDistanceMax *= 2;
+
+				break;
+			case ECheckQuality::Custom:
+				break;
+			default: ;
+			}
+		}
+
+		break;
+	case ERelevancyCheckType::Octree:
+		{
+			switch (RelevancyCheckQuality)
+			{
+			case ECheckQuality::Low:
+				break;
+			case ECheckQuality::Medium:
+				break;
+			case ECheckQuality::High:
+				break;
+			case ECheckQuality::Epic:
+				break;
+			case ECheckQuality::Custom:
+				break;
+			default: ;
+			}
+		}
+
+		break;
+	default: ;
+	}
+
+	switch (VisibilityCheckQuality)
+	{
+	case ECheckQuality::Low:
+		VisibilityLightCheckRate *= 4;
+		break;
+	case ECheckQuality::Medium:
+		VisibilityLightCheckRate *= 1;
+		break;
+	case ECheckQuality::High:
+		VisibilityLightCheckRate *= 0.75;
+		break;
+	case ECheckQuality::Epic:
+		VisibilityLightCheckRate *= 0.25;
+		break;
+	case ECheckQuality::Custom:
+		break;
+	default: ;
+	}
+
+	// SetComponentTickInterval(RelevantLightCheckRate);
+}
+
+
+void ULXRDetectionComponent::AddNewLights()
+{
+	for (TWeakObjectPtr NewLight : NewAllLightsToAdd)
+	{
+		if (NewLight.IsValid())
+		{
+			if (RelevancyCheckType == ERelevancyCheckType::Octree)
+			{
+				if (NewLight->bAlwaysRelevant)
+				{
+					DetectionTaskData->RelevantLights.Add(NewLight);
+				}
+				return;
+			}
+
+			if (RelevancyCheckType == ERelevancyCheckType::Smart)
+			{
+				const float DistSqr = FVector::DistSquared(NewLight.Get()->GetOwner()->GetActorLocation(), GetOwner()->GetActorLocation());
+				if (DistSqr > RelevancySmartDistanceMax * RelevancySmartDistanceMax)
+					SmartFarLights.AddUnique(NewLight);
+				if (DistSqr > RelevancySmartDistanceMin * RelevancySmartDistanceMin && DistSqr < RelevancySmartDistanceMax * RelevancySmartDistanceMax)
+					SmartMidLights.AddUnique(NewLight);
+				if (DistSqr < RelevancySmartDistanceMin * RelevancySmartDistanceMin)
+					SmartNearLights.AddUnique(NewLight);
+			}
+
+			AllLights.AddUnique(NewLight);
+		}
+	}
+	NewAllLightsToAdd.Empty();
+}
+
+
+void ULXRDetectionComponent::RemoveRedundantLights()
+{
+	for (TWeakObjectPtr<ULXRSourceComponent> RedundantLight : LightsToRemove)
+	{
+		if (RedundantLight.IsStale() || RedundantLight.IsValid())
+		{
+			if (AllLights.Contains(RedundantLight))
+				AllLights.RemoveSwap(RedundantLight);
+			if (DetectionTaskData->RelevantLights.Contains(RedundantLight))
+				DetectionTaskData->RelevantLightsToRemove.AddUnique(RedundantLight);
+			if (SmartNearLights.Contains(RedundantLight))
+				SmartNearLights.RemoveSwap(RedundantLight);
+			if (SmartMidLights.Contains(RedundantLight))
+				SmartMidLights.RemoveSwap(RedundantLight);
+			if (SmartFarLights.Contains(RedundantLight))
+				SmartFarLights.RemoveSwap(RedundantLight);
+			if (RelevantOctreeLights.Contains(RedundantLight))
+				RelevantOctreeLights.RemoveSwap(RedundantLight);
+		}
+		// else
+		// {
+		// 	if (RedundantLight.IsStale())
+		// 	{
+		// 		UE_LOG(LogLXR, Log, TEXT("LightSource is STALE!... "));
+		// 	}
+		// }
+	}
+
+	LightsToRemove.Empty();
+}
+
+void ULXRDetectionComponent::RemoveAllStaleLights()
+{
+	RemoveStaleLightsByLightArrayType(ELightArrayType::All);
+	RemoveStaleLightsByLightArrayType(ELightArrayType::SmartFar);
+	RemoveStaleLightsByLightArrayType(ELightArrayType::SmartMid);
+	RemoveStaleLightsByLightArrayType(ELightArrayType::SmartNear);
+	RemoveStaleLightsByLightArrayType(ELightArrayType::Relevant);
+}
+
+void ULXRDetectionComponent::RemoveStaleLightsByLightArrayType(ELightArrayType LightArrayType)
+{
+	TArray<TWeakObjectPtr<ULXRSourceComponent>> Array = GetLightArrayByLightArrayType(LightArrayType);
+	TArray<int> StaleLightsIndexes;
+
+	for (int i = 0; i < Array.Num(); ++i)
+	{
+		TWeakObjectPtr<ULXRSourceComponent> LightSourceComponent = Array[i];
+		if (!LightSourceComponent.IsValid())
+		{
+			if (Array[i].IsStale())
+			{
+				StaleLightsIndexes.AddUnique(i);
+			}
+		}
+	}
+
+	if (StaleLightsIndexes.Num() > 0)
+	{
+		for (int i = 0; i < StaleLightsIndexes.Num(); ++i)
+		{
+			if (Array.IsValidIndex(StaleLightsIndexes[i]))
+			{
+				if (Array[StaleLightsIndexes[i]].IsStale())
+				{
+					Array.RemoveAtSwap(StaleLightsIndexes[i]);
+				}
+			}
+		}
+	}
+}
+
+TMap<int, FLXR> ULXRDetectionComponent::GetIlluminatedTargets()
+{
+	return DetectionTaskData->TargetLXRData.TargetsLXR;
+}
+
+TArray<FVector> ULXRDetectionComponent::GetVisibilityTraceTypeTargets() const
+{
+	return GetTraceTargets(true);
+}
+
+TArray<ULXRSourceComponent*> ULXRDetectionComponent::GetPassedLights() const
+{
+	TArray<ULXRSourceComponent*> ReturnList;
+	for (auto It = DetectionTaskData->PassedDatas.CreateConstIterator(); It; ++It)
+	{
+		if (It->GetAllPassedTargets().Num() > 0)
+			ReturnList.Add(It->SourceComponent.Get());
+	}
+
+	return ReturnList;
+}
+
+TArray<ULightComponent*> ULXRDetectionComponent::GetPassedLightComponents(ULXRSourceComponent* InSourceComponent)
+{
+	if (!IsValid(InSourceComponent)) return {};
+	TArray<ULightComponent*> ReturnList;
+	TArray<ULightComponent*> LightComponents = InSourceComponent->GetMyLightComponents();
+
+	FLightSourcePassedData* Data = nullptr;
+	for (auto& Element : DetectionTaskData->PassedDatas)
+	{
+		if (Element.SourceComponent == InSourceComponent)
+		{
+			Data = &Element;
+			break;
+		}
+	}
+	if (Data != nullptr)
+	{
+		for (auto ComponentIndex : Data->GetAllPassedComponentsAsArray())
+		{
+			ReturnList.Add(LightComponents[ComponentIndex]);
+		};
+	}
+
+
+	return ReturnList;
+}
+
+
+FName ULXRDetectionComponent::GetSocketNameByTraceTargetIndex(int TraceTargetIndex)
+{
+	if (TraceTargetToSocketName.Contains(TraceTargetIndex))
+		return TraceTargetToSocketName[TraceTargetIndex];
+
+	return FName();
+}
+
+int ULXRDetectionComponent::GetTraceTargetIndexBySocketName(FName SocketName)
+{
+	if (SocketNameToTraceTarget.Contains(SocketName))
+		return SocketNameToTraceTarget[SocketName];
+
+	return INDEX_NONE;
+}
+
+TArray<FVector> ULXRDetectionComponent::GetTraceTargets(const bool& bIsRelevant, const ETraceTarget TargetOverride) const
+{
+	// TArray<FVector,TFixedAllocator<64>> Temp;
+	TArray<FVector> Temp;
+
+	const ETraceTarget TargetType = TargetOverride != ETraceTarget::None ? TargetOverride : bIsRelevant ? VisibilityTargetType : RelevancyTargetType;
+	switch (TargetType)
+	{
+	case ETraceTarget::ActorLocation:
+		{
+			Temp.AddUnique(GetOwner()->GetActorLocation());
+			break;
+		}
+	case ETraceTarget::Sockets:
+		{
+			for (FName Socket : CachedSockets)
+			{
+				if (RealSkeletalMeshComponent)
+				{
+					Temp.AddUnique(RealSkeletalMeshComponent->GetSocketLocation(Socket));
+				}
+			}
+		}
+		break;
+
+	case ETraceTarget::VectorArray:
+		{
+			for (auto Vector : TargetVectors)
+			{
+				Temp.Add(GetOwner()->GetTransform().TransformPosition(Vector));
+			}
+		}
+		break;
+	case ETraceTarget::ActorBounds:
+		{
+			FVector Origin;
+			FVector Extent;
+			GetOwner()->GetActorBounds(true, Origin, Extent);
+			Extent = Extent / 1.5;
+			Temp.AddUnique(GetOwner()->GetTransform().TransformPosition(FVector(0, 0, Extent.Z)));
+			Temp.AddUnique(GetOwner()->GetTransform().TransformPosition(FVector(0, 0, -Extent.Z + 15)));
+			Temp.AddUnique(GetOwner()->GetTransform().TransformPosition(FVector(0, Extent.Y * 0.5, Extent.Z * 0.1)));
+			Temp.AddUnique(GetOwner()->GetTransform().TransformPosition(FVector(0, -Extent.Y * 0.5, Extent.Z * 0.1)));
+			Temp.AddUnique(GetOwner()->GetTransform().TransformPosition(FVector(0, -Extent.Y * 0.5, Extent.Z * 0.1)));
+			Temp.AddUnique(GetOwner()->GetTransform().TransformPosition(FVector(Extent.X * 0.5, 0, 0)));
+			Temp.AddUnique(GetOwner()->GetTransform().TransformPosition(FVector(-Extent.X * 0.5, 0, 0)));
+		}
+		break;
+	case ETraceTarget::None:
+		break;
+	default:
+		break;
+	}
+
+#if UE_ENABLE_DEBUG_DRAWING
+	if (DebugOptions.bDebugRelevancy)
+		for (auto& Element : Temp)
+		{
+			DrawDebugCrosshairs(GetWorld(), Element, FRotator::MakeFromEuler(FVector::UpVector), 20.f, bIsRelevant ? FColor::Emerald : FColor::Cyan, false, 0.25f);
+		}
+#endif
+
+
+	return Temp;
+}

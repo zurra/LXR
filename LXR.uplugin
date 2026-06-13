@@ -1,0 +1,39 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "2.5.0-57",
+	"FriendlyName": "LXR",
+	"Description": "Advanced Light Detection System. Licensed under the LXR Community License.",
+	"Category": "Light Detection",f
+	"CreatedBy": "Hannes Väisänen",
+	"CreatedByURL": "",
+	"DocsURL": "https://docs.clusterfact.games/docs/LXR/",
+	"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/bfe03ff858fa4b8d9766d7e9113f3829",
+	"SupportURL": "https://discord.gg/aWvgSa9mKd",
+	"EngineVersion": "5.7.0",
+	"CanContainContent": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "LXR",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"WhitelistPlatforms": [
+				"Win64"
+			]
+		},
+		{
+			"Name": "LXREditor",
+			"Type": "Editor",
+			"LoadingPhase": "PreDefault",
+			"WhitelistPlatforms": [
+				"Win64"
+			]
+		},
+		{
+			"Name": "LXRFlux",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}
