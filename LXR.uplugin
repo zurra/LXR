@@ -1,10 +1,10 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "2.5.0-57",
+	"VersionName": "2.5.0-58",
 	"FriendlyName": "LXR",
 	"Description": "Advanced Light Detection System. Licensed under the LXR Community License.",
-	"Category": "Light Detection",f
+	"Category": "Light Detection",
 	"CreatedBy": "Hannes Väisänen",
 	"CreatedByURL": "",
 	"DocsURL": "https://docs.clusterfact.games/docs/LXR/",
